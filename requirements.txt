@@ -1,0 +1,7 @@
+-f https://download.pytorch.org/whl/cu117/torch_stable.html
+torch==1.13.1+cu117
+numba
+pygount
+pdbpp
+pytest
+pdbpp
