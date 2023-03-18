@@ -31,4 +31,4 @@ jobs:
           pip install -r requirements.txt
       - name: Test Flash Attention
         run: |
-          python -m pytest tests.py
+          python -m pytest test.py -v
