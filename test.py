@@ -4,7 +4,7 @@ import os
 import numpy as np
 import torch
 
-from flash_attention import ref_attention, flash_attention_forward
+from flash_attention import ref_attention, flash_attention_forward_cpu
 
 class TestFlashAttention:
 
@@ -28,7 +28,7 @@ class TestFlashAttention:
     def test_forward(self, seq_len, d_head):
         Q, K, V = self.initialize_matrices(seq_len, d_head)
         expected = ref_attention(Q, K, V)
-        actual = flash_attention_forward(Q, K, V)
+        actual = flash_attention_forward_cpu(Q, K, V)
         torch.allclose(expected, actual)        
 
     @pytest.mark.skip(reason="Not implemented yet")
