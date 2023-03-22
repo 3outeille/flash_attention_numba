@@ -2,6 +2,9 @@ import random
 import os
 import numpy as np
 import torch
+from numba import cuda, float32
+import math
+
 
 def seed_everything():
     seed = 42
@@ -79,21 +82,90 @@ def flash_attention_forward_cpu(Q, K, V):
             O[block_start_Br:block_end_Br, :] = Oi
     return O
 
+# Controls threads per block and shared memory usage.
+# The computation will be done on blocks of BLOCKSIZExBLOCKSIZE elements.
+# BLOCKSIZE should not be larger than 32 in this example (because max threads per block is 1024, and 32x32=1024)
+BLOCKSIZE = 16 # (16 * 16) * 4 = 1024 (because we have QKVO in shared memory)
+
+@cuda.jit
+def flash_attention_forward_gpu(Q, K, V, O):
+    
+    # TODO:
+    # 1. Load equally in shared memory for Q, K, V, O [DONE]
+    # 2. Just perform matmul between Q,K to check if everything still work [DONE]
+    # 3. Adapt with online softmax 
+
+
+    sQ = cuda.shared.array(shape=(BLOCKSIZE, BLOCKSIZE), dtype=float32)
+    sK = cuda.shared.array(shape=(BLOCKSIZE, BLOCKSIZE), dtype=float32)
+    # sV = cuda.shared.array(shape=(BLOCKSIZE, BLOCKSIZE), dtype=float32)
+    sO = cuda.shared.array(shape=(BLOCKSIZE, BLOCKSIZE), dtype=float32)
+
+    col = cuda.threadIdx.x + cuda.blockIdx.x * cuda.blockDim.x
+    row = cuda.threadIdx.y + cuda.blockIdx.y * cuda.blockDim.y
+    tx = cuda.threadIdx.x
+    ty = cuda.threadIdx.y
+
+    tmp = float32(0.)
+
+    # Loop until all tiles of a given direction are processed 
+    # (in order to have a complete matrix multiplication along this direction)
+    for blockId in range(cuda.gridDim.x):
+
+        # Load a tile of A and B into shared memory
+        if row < Q.shape[0] and tx + blockId * BLOCKSIZE < Q.shape[1]:
+            sQ[ty, tx] = Q[row, tx + blockId * BLOCKSIZE]
+        if col < K.shape[1] and ty + blockId * BLOCKSIZE < K.shape[0]:
+            sK[ty, tx] = K[ty + blockId * BLOCKSIZE, col]
+                    
+        cuda.syncthreads()
+
+        for k in range(BLOCKSIZE):
+            tmp += sQ[ty, k] * sK[k, tx]
+
+        cuda.syncthreads()
+
+    sO[ty, tx] = tmp
+
+    cuda.syncthreads()
+
+    if row < Q.shape[0] and col < K.shape[1]:
+        O[row, col] = sO[ty, tx]
+
+
 if __name__ == "__main__":
     seed_everything()
 
-    seq_len = 4
-    d_head = 4
+    seq_len = 6 # 32
+    d_head = 6 # 32
 
-    # Q = torch.randn(seq_len, d_head)
-    # K = torch.randn(seq_len, d_head)
-    # V = torch.randn(seq_len, d_head)
+    h_Q = (torch.arange(seq_len * d_head, dtype=torch.float32).reshape(seq_len, d_head) + 1.)
+    h_K = (torch.arange(seq_len * d_head, dtype=torch.float32).reshape(seq_len, d_head) + 1.)
+    h_V = (torch.arange(seq_len * d_head, dtype=torch.float32).reshape(seq_len, d_head) + 1.)
 
-    Q = (torch.arange(seq_len * d_head).reshape(seq_len, d_head) + 1.) / 10
-    K = (torch.arange(seq_len * d_head).reshape(seq_len, d_head) + 1.) / 10
-    V = (torch.arange(seq_len * d_head).reshape(seq_len, d_head) + 1.) / 10
+    # h_Q = (torch.arange(seq_len * d_head, dtype=torch.float32).reshape(seq_len, d_head) + 1.) / 10
+    # h_K = (torch.arange(seq_len * d_head, dtype=torch.float32).reshape(seq_len, d_head) + 1.) / 10
+    # h_V = (torch.arange(seq_len * d_head, dtype=torch.float32).reshape(seq_len, d_head) + 1.) / 10
+    h_actual = torch.zeros((seq_len, d_head), dtype=torch.float32)
 
-    expected = ref_attention(Q.clone(), K.clone(), V.clone())
-    actual = flash_attention_forward_cpu(Q.clone(), K.clone(), V.clone())
-    
-    assert torch.allclose(expected, actual)
+    # expected = ref_attention(h_Q.clone(), h_K.clone(), h_V.clone())
+
+    d_Q = cuda.to_device(h_Q)
+    d_K = cuda.to_device(h_K)
+    d_V = cuda.to_device(h_V)
+    d_actual = cuda.to_device(h_actual)
+
+    threadsperblock = (BLOCKSIZE, BLOCKSIZE)
+    blockspergrid_x = math.ceil(h_actual.shape[0] / threadsperblock[0])
+    blockspergrid_y = math.ceil(h_actual.shape[1] / threadsperblock[1])
+    blockspergrid = (blockspergrid_x, blockspergrid_y)
+    print(f"blockspergrid: {blockspergrid}, threadsperblock: {threadsperblock}")
+
+    flash_attention_forward_gpu[blockspergrid, threadsperblock](d_Q, d_K, d_V, d_actual)
+
+    h_actual = torch.from_numpy(d_actual.copy_to_host())
+    print(h_Q @ h_K)
+    print(h_actual)
+    print((h_Q @ h_K) - h_actual)
+
+    # assert torch.allclose(expected, h_actual)
