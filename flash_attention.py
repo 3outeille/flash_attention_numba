@@ -30,7 +30,7 @@ def flash_attention_forward_cpu(Q, K, V):
     # TODO: Should be size of tile (Shared memory size / 2)
     # TODO: Becareful, in GPU, we use the same shared memory for QKV and O (output) so we should divide Shared memory by 4
     Br = 4 # 4 # Control number of row loaded
-    Bc = 2 #d_head # Control number of column loaded
+    Bc = 4 #d_head # Control number of column loaded
 
     # line 3
     O = torch.zeros((seq_len, d_head))
@@ -57,7 +57,8 @@ def flash_attention_forward_cpu(Q, K, V):
             Qi = Q[block_start_Br:block_end_Br, :]  # shape Br x d_head
 
             # line 10
-            Sij = Qi @ Kj.T  # shape Br x Bc
+            # FIXME: change Kj to Kj.T
+            Sij = Qi @ Kj  # shape Br x Bc
             
             # line 12: find max of each row of the current loaded block
             tile_rowmax = torch.max(Sij, dim=1).values[:, None]
@@ -73,23 +74,37 @@ def flash_attention_forward_cpu(Q, K, V):
 
             # line 15: Attention computation on tile
             # Oi = [exp(Q_i @ Ki.T - curr_rowmax) / sum(exp(Q_i @ Ki.T - curr_rowmax))] @ Vi
-            Oi = (Oi * (prev_denominator * update_prev_exponent) / new_denominator) + ((tile_numerator * torch.exp(tile_rowmax - new_rowmax)) / new_denominator) @ Vj
-
+            left = (Oi * (prev_denominator * update_prev_exponent) / new_denominator)
+            right = ((tile_numerator * torch.exp(tile_rowmax - new_rowmax)) / new_denominator)
+            # print("---tile numerator---")
+            # print(tile_numerator)
+            # print("---torch exp---")
+            # print(torch.exp(tile_rowmax - new_rowmax))
+            # print("---new denominator---")
+            # print(new_denominator)
+            print("---right---")
+            print(right)
+            print("---V---")
+            print(Vj)
+            Oi = left + right @ Vj
+            print("----right V----")
+            print(right @ Vj)
             # line 16: save statistics
             state_rowmax[block_start_Br:block_end_Br, :] = new_rowmax
             state_denominator[block_start_Br:block_end_Br, :] = new_denominator 
 
             O[block_start_Br:block_end_Br, :] = Oi
+            print(O[block_start_Br:block_end_Br, :])
     return O
 
 # Controls threads per block and shared memory usage.
 # The computation will be done on blocks of BLOCKSIZExBLOCKSIZE elements.
 # BLOCKSIZE should not be larger than 32 in this example (because max threads per block is 1024, and 32x32=1024)
-BLOCKSIZE = 2#16 # (16 * 16) * 4 = 1024 (because we have QKVO in shared memory)
+BLOCKSIZE = 4 # (16 * 16) * 4 = 1024 (because we have QKVO in shared memory)
 
 
 @cuda.jit
-def flash_attention_forward_gpu(Q, K, V, O, tile_rowmax, tile_numerator, tile_denominator, new_rowmax, state_rowmax, state_denominator):
+def flash_attention_forward_gpu(Q, K, V, O, tile_rowmax, tile_numerator, tile_denominator, new_rowmax, state_rowmax, state_denominator, right, right_V):
     
     # TODO: (seq_len, d_head) = (2,2)
     # 1. Test on 1 tile (BLOCKSIZE = 4)
@@ -149,17 +164,16 @@ def flash_attention_forward_gpu(Q, K, V, O, tile_rowmax, tile_numerator, tile_de
 
     if row < Q.shape[0] and col < K.shape[1]:
         left = O[row, col] * (state_denominator[row] * cuda.libdevice.exp(state_rowmax[row] - new_rowmax[row])) / new_denominator 
-        right = (tile_numerator[ty, tx] * cuda.libdevice.exp(tile_rowmax[row] - new_rowmax[row])) / new_denominator
+        right[ty, tx] = (tile_numerator[ty, tx] * cuda.libdevice.exp(tile_rowmax[row] - new_rowmax[row])) / new_denominator
         cuda.syncthreads()
 
-        print(right)
+        # right @ sV
+        for k in range(BLOCKSIZE):
+            right_V[ty, tx] += right[ty, k] * sV[k, tx]
 
-        # right_V = float64(0.)
-        # # right @ sV
-        # for k in range(BLOCKSIZE):
-        #     right_V += right * sV[ty, k]
+        cuda.syncthreads()
 
-        # O[row, col] = left + right_V
+        O[row, col] = left + right_V[row, col]
 
     cuda.syncthreads()
 
@@ -183,14 +197,12 @@ if __name__ == "__main__":
     h_V = (torch.arange(seq_len * d_head, dtype=torch.float64).reshape(seq_len, d_head) + 1.) / 10
     h_actual = torch.zeros((seq_len, d_head), dtype=torch.float64)
 
-
-    # expected = ref_attention(h_Q.clone(), h_K.clone(), h_V.clone())
+    expected = flash_attention_forward_cpu(h_Q.clone(), h_K.clone(), h_V.clone())
+    expected = expected.to(torch.float64)
 
     d_Q = cuda.to_device(h_Q)
     d_K = cuda.to_device(h_K)
     d_V = cuda.to_device(h_V)
-    # d_state_rowmax = cuda.to_device(h_state_rowmax)
-    # d_state_denominator = cuda.to_device(h_state_denominator)
     d_actual = cuda.to_device(h_actual)
 
     threadsperblock = (BLOCKSIZE, BLOCKSIZE)
@@ -217,6 +229,12 @@ if __name__ == "__main__":
     h_state_denominator = torch.zeros(seq_len, dtype=torch.float64)
     d_state_denominator = cuda.to_device(h_state_denominator)
 
+    h_right = torch.zeros(BLOCKSIZE * BLOCKSIZE, dtype=torch.float64).reshape(BLOCKSIZE, BLOCKSIZE)
+    d_right = cuda.to_device(h_right)
+
+    h_right_V = torch.zeros(BLOCKSIZE * d_head, dtype=torch.float64).reshape(BLOCKSIZE, d_head)
+    d_right_V = cuda.to_device(h_right_V)
+
     # TODO: K must be transposed before passing it to the kernel (for Attention)
     flash_attention_forward_gpu[blockspergrid, threadsperblock](
         d_Q,
@@ -228,20 +246,43 @@ if __name__ == "__main__":
         d_tile_denominator,
         d_new_rowmax,
         d_state_rowmax,
-        d_state_denominator
+        d_state_denominator,
+        d_right,
+        d_right_V
     )
 
     h_actual = torch.from_numpy(d_actual.copy_to_host())
-    print(h_Q @ h_K)
-    print(h_actual)
 
     h_tile_rowmax = torch.from_numpy(d_tile_rowmax.copy_to_host())
     print(h_tile_rowmax)
-    h_tile_denominator = torch.from_numpy(d_tile_denominator.copy_to_host())
-    print(h_tile_denominator)
 
-    h_state_denominator = torch.from_numpy(d_state_denominator.copy_to_host())
-    print(h_state_denominator)
+    # print("--- tile_numerator ---")
+    # h_tile_numerator = torch.from_numpy(d_tile_numerator.copy_to_host())
+    # print(h_tile_numerator)
+    
+    # print("--- tile_denominator ---")
+    # h_tile_denominator = torch.from_numpy(d_tile_denominator.copy_to_host())
+    # print(h_tile_denominator)
 
-    assert torch.allclose(h_Q @ h_K, h_actual)
-    # assert torch.allclose(expected, h_actual)
+    # print("--- state denominator---")
+    # h_state_denominator = torch.from_numpy(d_state_denominator.copy_to_host())
+    # print(h_state_denominator)
+
+    print("--- right ---")
+    h_right = torch.from_numpy(d_right.copy_to_host())
+    print(h_right)
+
+    print("--- Vj ---")
+    print(h_V)
+
+    print("--- right_V ---")
+    h_right_V = torch.from_numpy(d_right_V.copy_to_host())
+    print(h_right_V)
+
+    print("--- actual ---")
+    print(h_actual)
+
+    print("--- expected ---")
+    print(expected, type(expected))
+
+    assert torch.allclose(expected, h_actual)
