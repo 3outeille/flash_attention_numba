@@ -89,7 +89,7 @@ BLOCKSIZE = 2#16 # (16 * 16) * 4 = 1024 (because we have QKVO in shared memory)
 
 
 @cuda.jit
-def flash_attention_forward_gpu(Q, K, V, O, tile_rowmax, tile_numerator, tile_denominator, state_rowmax, state_denominator):
+def flash_attention_forward_gpu(Q, K, V, O, tile_rowmax, tile_numerator, tile_denominator, new_rowmax, state_rowmax, state_denominator):
     
     # TODO: (seq_len, d_head) = (2,2)
     # 1. Test on 1 tile (BLOCKSIZE = 4)
@@ -141,19 +141,30 @@ def flash_attention_forward_gpu(Q, K, V, O, tile_rowmax, tile_numerator, tile_de
     cuda.atomic.add(tile_denominator, row, tile_numerator[ty, tx])
 
     # Compute new rowmax
-    cuda.atomic.max(state_rowmax, row, tile_rowmax[row])
+    cuda.atomic.max(new_rowmax, row, tile_rowmax[row])
 
-
-    # line 13: Online softmax
-    #new_rowmax = torch.max(torch.column_stack([prev_rowmax, tile_rowmax]), dim=1).values[:, None]
-    # update_prev_exponent = torch.exp(prev_rowmax - new_rowmax)
-    # new_denominator = prev_denominator * update_prev_exponent + torch.exp(tile_rowmax - new_rowmax) * tile_denominator
-
-
+    #TODO: Use variable instead of array ?
+    new_denominator = state_denominator[row] * (cuda.libdevice.exp(state_rowmax[row] - new_rowmax[row])) + cuda.libdevice.exp(tile_rowmax[row] - new_rowmax[row]) * tile_denominator[row]
+    cuda.syncthreads()
 
     if row < Q.shape[0] and col < K.shape[1]:
-        O[row, col] = tile_numerator[ty, tx]
+        left = O[row, col] * (state_denominator[row] * cuda.libdevice.exp(state_rowmax[row] - new_rowmax[row])) / new_denominator 
+        right = (tile_numerator[ty, tx] * cuda.libdevice.exp(tile_rowmax[row] - new_rowmax[row])) / new_denominator
+        cuda.syncthreads()
 
+        print(right)
+
+        # right_V = float64(0.)
+        # # right @ sV
+        # for k in range(BLOCKSIZE):
+        #     right_V += right * sV[ty, k]
+
+        # O[row, col] = left + right_V
+
+    cuda.syncthreads()
+
+    state_rowmax[row] = new_rowmax[row]
+    state_denominator[row] = new_denominator
 
 if __name__ == "__main__":
     seed_everything()
@@ -200,11 +211,25 @@ if __name__ == "__main__":
     h_state_rowmax = torch.empty(seq_len).fill_(-float('inf'))
     d_state_rowmax = cuda.to_device(h_state_rowmax)
 
+    h_new_rowmax = torch.empty(seq_len).fill_(-float('inf'))
+    d_new_rowmax = cuda.to_device(h_new_rowmax)
+
     h_state_denominator = torch.zeros(seq_len, dtype=torch.float64)
     d_state_denominator = cuda.to_device(h_state_denominator)
 
     # TODO: K must be transposed before passing it to the kernel (for Attention)
-    flash_attention_forward_gpu[blockspergrid, threadsperblock](d_Q, d_K, d_V, d_actual, d_tile_rowmax, d_tile_numerator, d_tile_denominator, d_state_rowmax, d_state_denominator)
+    flash_attention_forward_gpu[blockspergrid, threadsperblock](
+        d_Q,
+        d_K,
+        d_V,
+        d_actual,
+        d_tile_rowmax,
+        d_tile_numerator,
+        d_tile_denominator,
+        d_new_rowmax,
+        d_state_rowmax,
+        d_state_denominator
+    )
 
     h_actual = torch.from_numpy(d_actual.copy_to_host())
     print(h_Q @ h_K)
@@ -214,6 +239,9 @@ if __name__ == "__main__":
     print(h_tile_rowmax)
     h_tile_denominator = torch.from_numpy(d_tile_denominator.copy_to_host())
     print(h_tile_denominator)
+
+    h_state_denominator = torch.from_numpy(d_state_denominator.copy_to_host())
+    print(h_state_denominator)
 
     assert torch.allclose(h_Q @ h_K, h_actual)
     # assert torch.allclose(expected, h_actual)
