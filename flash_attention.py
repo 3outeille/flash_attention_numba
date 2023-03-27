@@ -29,8 +29,8 @@ def flash_attention_forward_cpu(Q, K, V):
     seq_len, d_head = Q.shape
     # TODO: Should be size of tile (Shared memory size / 2)
     # TODO: Becareful, in GPU, we use the same shared memory for QKV and O (output) so we should divide Shared memory by 4
-    Br = 4 # 4 # Control number of row loaded
-    Bc = 4 #d_head # Control number of column loaded
+    Br = Q.shape[0] // 2 # 4 # Control number of row loaded
+    Bc = Q.shape[1] // 2 #d_head # Control number of column loaded
 
     # line 3
     O = torch.zeros((seq_len, d_head))
@@ -57,8 +57,7 @@ def flash_attention_forward_cpu(Q, K, V):
             Qi = Q[block_start_Br:block_end_Br, :]  # shape Br x d_head
 
             # line 10
-            # FIXME: change Kj to Kj.T
-            Sij = Qi @ Kj  # shape Br x Bc
+            Sij = Qi @ Kj.T  # shape Br x Bc
             
             # line 12: find max of each row of the current loaded block
             tile_rowmax = torch.max(Sij, dim=1).values[:, None]
@@ -76,12 +75,9 @@ def flash_attention_forward_cpu(Q, K, V):
             # Oi = [exp(Q_i @ Ki.T - curr_rowmax) / sum(exp(Q_i @ Ki.T - curr_rowmax))] @ Vi
             left = (Oi * (prev_denominator * update_prev_exponent) / new_denominator)
             right = ((tile_numerator * torch.exp(tile_rowmax - new_rowmax)) / new_denominator)
-            # print("---tile numerator---")
-            # print(tile_numerator)
-            # print("---torch exp---")
-            # print(torch.exp(tile_rowmax - new_rowmax))
-            # print("---new denominator---")
-            # print(new_denominator)
+            print("=================================================")
+            print("---left---")
+            print(left)
             print("---right---")
             print(right)
             print("---V---")
@@ -94,6 +90,7 @@ def flash_attention_forward_cpu(Q, K, V):
             state_denominator[block_start_Br:block_end_Br, :] = new_denominator 
 
             O[block_start_Br:block_end_Br, :] = Oi
+            print("---O---")
             print(O[block_start_Br:block_end_Br, :])
     return O
 
@@ -104,7 +101,7 @@ BLOCKSIZE = 4 # (16 * 16) * 4 = 1024 (because we have QKVO in shared memory)
 
 
 @cuda.jit
-def flash_attention_forward_gpu(Q, K, V, O, tile_rowmax, tile_numerator, tile_denominator, new_rowmax, state_rowmax, state_denominator, right, right_V):
+def flash_attention_forward_gpu(Q, K, V, O, tile_rowmax, tile_numerator, tile_denominator, new_rowmax, state_rowmax, state_denominator, right, right_V, left):
     
     # TODO: (seq_len, d_head) = (2,2)
     # 1. Test on 1 tile (BLOCKSIZE = 4)
@@ -128,6 +125,7 @@ def flash_attention_forward_gpu(Q, K, V, O, tile_rowmax, tile_numerator, tile_de
         if row < Q.shape[0] and tx + blockId * BLOCKSIZE < Q.shape[1]:
             sQ[ty, tx] = Q[row, tx + blockId * BLOCKSIZE]
         if col < K.shape[1] and ty + blockId * BLOCKSIZE < K.shape[0]:
+            #FIXME: K should be transposed here (S). Can we just do .transpose() ?
             sK[ty, tx] = K[ty + blockId * BLOCKSIZE, col]
         if col < V.shape[1] and ty + blockId * BLOCKSIZE < V.shape[0]:
             sV[ty, tx] = V[ty + blockId * BLOCKSIZE, col]
@@ -136,7 +134,7 @@ def flash_attention_forward_gpu(Q, K, V, O, tile_rowmax, tile_numerator, tile_de
 
         # Matmul on the current tile
         for k in range(BLOCKSIZE):
-            # TODO: K should be transposed here (S). Can we just do .transpose() ?
+            #FIXME: K should be transposed here (S). Can we just do .transpose() ?
             sO[ty, tx] += sQ[ty, k] * sK[k, tx]
 
         cuda.syncthreads()
@@ -163,7 +161,7 @@ def flash_attention_forward_gpu(Q, K, V, O, tile_rowmax, tile_numerator, tile_de
     cuda.syncthreads()
 
     if row < Q.shape[0] and col < K.shape[1]:
-        left = O[row, col] * (state_denominator[row] * cuda.libdevice.exp(state_rowmax[row] - new_rowmax[row])) / new_denominator 
+        left[ty, tx] = O[row, col] * (state_denominator[row] * cuda.libdevice.exp(state_rowmax[row] - new_rowmax[row])) / new_denominator 
         right[ty, tx] = (tile_numerator[ty, tx] * cuda.libdevice.exp(tile_rowmax[row] - new_rowmax[row])) / new_denominator
         cuda.syncthreads()
 
@@ -173,7 +171,7 @@ def flash_attention_forward_gpu(Q, K, V, O, tile_rowmax, tile_numerator, tile_de
 
         cuda.syncthreads()
 
-        O[row, col] = left + right_V[row, col]
+        O[row, col] = left[row, col] + right_V[row, col]
 
     cuda.syncthreads()
 
@@ -201,7 +199,7 @@ if __name__ == "__main__":
     expected = expected.to(torch.float64)
 
     d_Q = cuda.to_device(h_Q)
-    d_K = cuda.to_device(h_K)
+    d_K = cuda.to_device(h_K.T) #FIXME: For now, we transpose K outside the kernel
     d_V = cuda.to_device(h_V)
     d_actual = cuda.to_device(h_actual)
 
@@ -235,6 +233,9 @@ if __name__ == "__main__":
     h_right_V = torch.zeros(BLOCKSIZE * d_head, dtype=torch.float64).reshape(BLOCKSIZE, d_head)
     d_right_V = cuda.to_device(h_right_V)
 
+    h_left = torch.zeros(BLOCKSIZE * d_head, dtype=torch.float64).reshape(BLOCKSIZE, d_head)
+    d_left = cuda.to_device(h_left)
+
     # TODO: K must be transposed before passing it to the kernel (for Attention)
     flash_attention_forward_gpu[blockspergrid, threadsperblock](
         d_Q,
@@ -248,7 +249,8 @@ if __name__ == "__main__":
         d_state_rowmax,
         d_state_denominator,
         d_right,
-        d_right_V
+        d_right_V,
+        d_left
     )
 
     h_actual = torch.from_numpy(d_actual.copy_to_host())
@@ -267,17 +269,21 @@ if __name__ == "__main__":
     # print("--- state denominator---")
     # h_state_denominator = torch.from_numpy(d_state_denominator.copy_to_host())
     # print(h_state_denominator)
+    print("--- left ---")
+    h_left = torch.from_numpy(d_left.copy_to_host())
+    print(h_left)
 
     print("--- right ---")
     h_right = torch.from_numpy(d_right.copy_to_host())
     print(h_right)
 
-    print("--- Vj ---")
+    print("--- V ---")
     print(h_V)
 
     print("--- right_V ---")
     h_right_V = torch.from_numpy(d_right_V.copy_to_host())
     print(h_right_V)
+
 
     print("--- actual ---")
     print(h_actual)
