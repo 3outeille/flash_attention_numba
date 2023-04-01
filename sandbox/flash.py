@@ -1,5 +1,5 @@
 import numpy as np
-from numba import cuda, float64
+from numba import cuda, float64, int64
 import math
 import torch
 
@@ -14,39 +14,61 @@ def ref_attention(Q, K, V):
     return S
 
 @cuda.jit
-def flash_attention(Q, K, V, O, smem_offset, S_debug):
+def flash_attention(Q, K, V, O, S_debug):
+    SEQ_LEN = Q.shape[2]
+    D_HEAD = Q.shape[3]
+    BLOCK_SIZE = cuda.blockDim.x
     tid = cuda.threadIdx.x
 
-    sQ = cuda.shared.array(0, dtype=float64)[:smem_offset] # 32 * 8 = 256
-    sK = cuda.shared.array(0, dtype=float64)[smem_offset:2*smem_offset]
-    sO = cuda.shared.array(0, dtype=float64)[2*smem_offset:3*smem_offset]
-    sS = cuda.shared.array(0, dtype=float64)[3*smem_offset:] # 32 * 32 * 8 = 8192
+    sQ = cuda.shared.array(0, dtype=np.float64)[:D_HEAD]
+    sK = cuda.shared.array(0, dtype=np.float64)[D_HEAD:2*D_HEAD]
 
-    # 3rd dim is always at 0 because from now on, we treat Q as (B, C, SEQ_LEN * D_HEAD)
-    # Load Q into shared memory
-    sQ[tid] = Q[cuda.blockIdx.y, cuda.blockIdx.z, 0, tid + cuda.blockIdx.x * cuda.blockDim.x]
-    # sK[tid] = K[cuda.blockIdx.y, cuda.blockIdx.z, 0, tid + cuda.blockIdx.x * cuda.blockDim.x]
+    if tid >= D_HEAD:
+        return
 
-    cuda.syncthreads()
+    Q_offset = int64(0)
 
-    # tmp = float64(0)
-    # tmp += sQ[tid] * sK[tid]
-    #TODO: Perform Matmul in 4D and stored in S_debug 
-    if cuda.blockIdx.x == 1 and cuda.blockIdx.y == 0 and cuda.blockIdx.z == 0:
-        print(tid, sQ[tid])
-    
-    cuda.syncthreads()
+    for i in range(SEQ_LEN):
 
-    # O[cuda.blockIdx.y, cuda.blockIdx.z, 0, tid + cuda.blockIdx.x * cuda.blockDim.x] = sS[tid]
+        for l in range(D_HEAD // BLOCK_SIZE):
+            # 3rd dim is always at 0 because from now on, we treat Q as (B, C, SEQ_LEN * D_HEAD)
+            sQ[tid + l * BLOCK_SIZE] = Q[cuda.blockIdx.y, cuda.blockIdx.z, 0, tid + (i + l) * BLOCK_SIZE + Q_offset]
+
+        cuda.syncthreads()
+        
+        K_offset = int64(0)
+
+        for j in range(SEQ_LEN):
+            
+            for l in range(D_HEAD // BLOCK_SIZE):
+                sK[tid + l * BLOCK_SIZE] = K[cuda.blockIdx.y, cuda.blockIdx.z, 0, tid + (j + l) * BLOCK_SIZE + K_offset]
+
+            cuda.syncthreads()
+
+            tmp = float64(0)
+
+            for k in range(D_HEAD):
+                tmp += sQ[k] * sK[k]
+
+            S_debug[cuda.blockIdx.y, cuda.blockIdx.z, i, j] = tmp
+            
+            K_offset += (D_HEAD // BLOCK_SIZE - 1)*BLOCK_SIZE
+
+            # if cuda.blockIdx.x == 0 and cuda.blockIdx.y == 0 and cuda.blockIdx.z == 0:
+            #     if tid == 0:
+            #         for i in range(D_HEAD):
+            #             print(i, sQ[i], sK[i])
+
+        Q_offset += (D_HEAD // BLOCK_SIZE - 1)*BLOCK_SIZE
 
 
 if __name__ == "__main__":
-    B, C, SEQ_LEN, D_HEAD = (3, 2, 2, 32)
+    B, C, SEQ_LEN, D_HEAD = (3, 1, 2, 32) #128
     Q = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=torch.float64).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
     K = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=torch.float64).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
     V = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=torch.float64).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
     # TODO: init O with zeros inside the kernel
-    O = torch.zeros((B,  C, SEQ_LEN, D_HEAD), dtype=torch.float64)
+    O = torch.zeros((B, C, SEQ_LEN, D_HEAD), dtype=torch.float64)
 
     ref = ref_attention(Q.clone(), K.clone(), V.clone())
 
@@ -59,10 +81,10 @@ if __name__ == "__main__":
     stream = cuda.default_stream()
     threadsperblock = (32, 1, 1)
     blockspergrid = (math.ceil(Q.shape[2] * Q.shape[3] / threadsperblock[0]), B, C)
-    shared_memory_size = (threadsperblock[0] * np.dtype(np.float64).itemsize) * 3 + (SEQ_LEN**2 * np.dtype(np.float64).itemsize)
-    smem_offset = threadsperblock[0] * np.dtype(np.float64).itemsize
-    print(f"blockspergrid: {blockspergrid}, threadsperblock: {threadsperblock}, shared_memory_size: {shared_memory_size}, smem_offset: {smem_offset}")
+    shared_memory_size = (D_HEAD * np.dtype(np.float64).itemsize) * 2# + (SEQ_LEN**2 * np.dtype(np.float64).itemsize)
+    print(f"blockspergrid: {blockspergrid}, threadsperblock: {threadsperblock}, shared_memory_size: {shared_memory_size}")
 
+    # ====== DEBUG ======
     d_S_debug = cuda.to_device(torch.zeros((B, C, SEQ_LEN, SEQ_LEN), dtype=torch.float64))
 
     flash_attention[blockspergrid, threadsperblock, stream, shared_memory_size](
@@ -70,14 +92,15 @@ if __name__ == "__main__":
         d_K,
         d_V,
         d_O,
-        smem_offset,
         # DEBUG
         d_S_debug
     )
     
-    # pred = torch.from_numpy(d_O.copy_to_host())
-    # assert torch.allclose(ref, pred)
+    cuda.synchronize()
 
     S_debug = torch.from_numpy(d_S_debug.copy_to_host())
+    print(ref)
+    print("=====")
+    print(S_debug)
 
     assert torch.allclose(ref, S_debug)
