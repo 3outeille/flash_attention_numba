@@ -96,6 +96,11 @@ def flash_attention_forward_cpu(Q, K, V):
 
 @cuda.jit
 def flash_attention(Q, K, V, O, S_debug):
+
+    # TODO: Handle multiple blocks
+    # TODO: Handle K transpose loading
+    # TODO: divide by sqrt(dk)
+
     SEQ_LEN = Q.shape[2]
     D_HEAD = Q.shape[3]
     BLOCK_SIZE = cuda.blockDim.x
@@ -126,7 +131,7 @@ def flash_attention(Q, K, V, O, S_debug):
             tmp += sQ[k] * sK[k]
 
         sS[cuda.blockIdx.x * SEQ_LEN + i] = tmp
-        # S_debug[cuda.blockIdx.y, cuda.blockIdx.z, cuda.blockIdx.x, i] = sS[cuda.blockIdx.x * SEQ_LEN + i]
+        S_debug[cuda.blockIdx.y, cuda.blockIdx.z, cuda.blockIdx.x, i] = sS[cuda.blockIdx.x * SEQ_LEN + i]
         tile_rowmax = cuda.libdevice.fmax(tile_rowmax, sS[cuda.blockIdx.x * SEQ_LEN + i])
 
         cuda.syncthreads()
@@ -136,8 +141,11 @@ def flash_attention(Q, K, V, O, S_debug):
     tile_numerator = float64(0)
 
     for i in range(SEQ_LEN):
+        #FIXME: do we really need to split ?
         tile_numerator = cuda.libdevice.exp(sS[cuda.blockIdx.x * SEQ_LEN + i] - tile_rowmax)
-        tile_denominator += tile_numerator
+        cuda.syncthreads()
+        sS[cuda.blockIdx.x * SEQ_LEN + i] = tile_numerator
+        tile_denominator += sS[cuda.blockIdx.x * SEQ_LEN + i]
 
     cuda.syncthreads()
 
@@ -153,19 +161,43 @@ def flash_attention(Q, K, V, O, S_debug):
 
     cuda.syncthreads()
 
-    # left = sO[tid] * (prev_denominator * update_prev_exponent) / new_denominator
-    # right = (tile_numerator * cuda.libdevice.exp(tile_rowmax - new_rowmax)) / new_denominator
+    sO[tid] = O[cuda.blockIdx.y, cuda.blockIdx.z, 0, tid + Q_offset]
 
+    cuda.syncthreads()
+
+    left = sO[tid] * (prev_denominator * update_prev_exponent) / new_denominator
+    
+    cuda.syncthreads()
+
+    tmp = float64(0)
+
+    for i in range(SEQ_LEN):
+        #FIXME: Can we load sK once outside of for loop?
+        sK[tid] = V[cuda.blockIdx.y, cuda.blockIdx.z, i, tid]
+        right = (sS[cuda.blockIdx.x * SEQ_LEN + i] * cuda.libdevice.exp(tile_rowmax - new_rowmax)) / new_denominator
+        tmp += right * sK[tid]
+        
+    sO[tid] = left + tmp
+
+    cuda.syncthreads()
+    
+    O[cuda.blockIdx.y, cuda.blockIdx.z, 0, tid + Q_offset] = sO[tid]
+
+    cuda.syncthreads()
+
+    tile_rowmax = new_rowmax
+    tile_denominator = new_denominator
+     
 
 if __name__ == "__main__":
-    B, C, SEQ_LEN, D_HEAD = (3, 1, 2, 32) #128
+    B, C, SEQ_LEN, D_HEAD = (3, 4, 2, 3) #128
     Q = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=torch.float64).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
     K = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=torch.float64).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
     V = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=torch.float64).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
     # TODO: init O with zeros inside the kernel
     O = torch.zeros((B, C, SEQ_LEN, D_HEAD), dtype=torch.float64)
 
-    ref = ref_attention(Q.clone()[0, 0, ...], K.clone()[0, 0, ...], V.clone()[0, 0, ...])
+    # ref = ref_attention(Q.clone()[0, 0, ...], K.clone()[0, 0, ...], V.clone()[0, 0, ...])
     # pred = flash_attention_forward_cpu(Q.clone()[0, 0, ...], K.clone()[0, 0, ...], V.clone()[0, 0, ...])
 
     # assert torch.allclose(ref, pred)
@@ -191,15 +223,14 @@ if __name__ == "__main__":
         d_V,
         d_O,
         # DEBUG
-        d_S_debug
+        d_S_debug,
     )
     
     cuda.synchronize()
 
-    S_debug = torch.from_numpy(d_S_debug.copy_to_host())
-    ref_gpu = ref_attention(Q.clone(), K.clone(), V.clone())
-    # print(ref_gpu)
-    # print("=====")
-    # print(S_debug)
+    # S_debug = torch.from_numpy(d_S_debug.copy_to_host())
+    O = torch.from_numpy(d_O.copy_to_host())
+    ref_cpu = ref_attention(Q.clone(), K.clone(), V.clone())
+    print(O - ref_cpu)
 
-    assert torch.allclose(ref_gpu, S_debug)
+    assert torch.allclose(ref_cpu, O)
