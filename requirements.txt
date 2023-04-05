@@ -4,4 +4,3 @@ numba
 pygount
 pdbpp
 pytest
-pdbpp

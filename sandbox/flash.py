@@ -4,6 +4,7 @@ import math
 import torch
 
 def ref_attention(Q, K, V):
+    #TODO: divide by sqrt(d_k)
     S = torch.matmul(Q, K.transpose(-2, -1))
     P = torch.softmax(S, dim=-1)
     O =  torch.matmul(P, V)
@@ -18,13 +19,13 @@ def flash_attention_forward_cpu(Q, K, V):
     seq_len, d_head = Q.shape
     # TODO: Should be size of tile (Shared memory size / 2)
     # TODO: Becareful, in GPU, we use the same shared memory for QKV and O (output) so we should divide Shared memory by 4
-    Br = Q.shape[-2]  # 4 # Control number of row loaded
-    Bc = Q.shape[-1] #d_head # Control number of column loaded
+    Br = Q.shape[0] // 2 # 4 # Control number of row loaded
+    Bc = Q.shape[1] // 2 #d_head # Control number of column loaded
 
     # line 3
-    O = torch.zeros((seq_len, d_head), dtype=Q.dtype)
+    O = torch.zeros((seq_len, d_head))
     state_rowmax = torch.full((seq_len, 1), -torch.inf) # Row max "m"
-    state_denominator = torch.zeros((seq_len, 1), dtype=Q.dtype) # Softmax denominator "l"
+    state_denominator = torch.zeros((seq_len, 1)) # Softmax denominator "l"
 
     # This is range(seq_len) because we load part of rows with ALL its columns
     for block_start_Bc in range(0, seq_len, Bc):
@@ -46,27 +47,17 @@ def flash_attention_forward_cpu(Q, K, V):
             Qi = Q[block_start_Br:block_end_Br, :]  # shape Br x d_head
 
             # line 10
-            Sij = torch.matmul(Qi, Kj.transpose(-2, -1))  # shape Br x Bc
+            Sij = Qi @ Kj.T  # shape Br x Bc
             
-            print("=================================================")
             # line 12: find max of each row of the current loaded block
-            tile_rowmax = torch.max(Sij, dim=-1).values[..., None]
-            tile_numerator = torch.exp(Sij - tile_rowmax)
-            print("--- tile_rowmax ---")
-            print(tile_rowmax)
+            tile_rowmax = torch.max(Sij, dim=1).values[:, None]
             # line 12: compute the softmax numerator
-            print("--- tile_numerator ---")
-            print(tile_numerator)
+            tile_numerator = torch.exp(Sij - tile_rowmax)
             # line 12: compute the softmax denominator
-            tile_denominator = torch.sum(tile_numerator, dim=-1)[:, None]
-            print("--- tile_denominator ---")
-            print(tile_denominator)
+            tile_denominator = torch.sum(tile_numerator, dim=1)[:, None]
 
             # line 13: Online softmax
-            new_rowmax = torch.max(torch.column_stack([prev_rowmax, tile_rowmax]), dim=-1).values[..., None]
-            print("--- new_rowmax ---")
-            print(new_rowmax)
-
+            new_rowmax = torch.max(torch.column_stack([prev_rowmax, tile_rowmax]), dim=1).values[:, None]
             update_prev_exponent = torch.exp(prev_rowmax - new_rowmax)
             new_denominator = prev_denominator * update_prev_exponent + torch.exp(tile_rowmax - new_rowmax) * tile_denominator
 
@@ -74,13 +65,14 @@ def flash_attention_forward_cpu(Q, K, V):
             # Oi = [exp(Q_i @ Ki.T - curr_rowmax) / sum(exp(Q_i @ Ki.T - curr_rowmax))] @ Vi
             left = (Oi * (prev_denominator * update_prev_exponent) / new_denominator)
             right = ((tile_numerator * torch.exp(tile_rowmax - new_rowmax)) / new_denominator)
+            print("=================================================")
             print("---left---")
             print(left)
             print("---right---")
-            print(right, right.shape)
+            print(right)
             print("---V---")
-            print(Vj, Vj.shape)
-            Oi = left + torch.matmul(right, Vj)
+            print(Vj)
+            Oi = left + right @ Vj
             print("----right V----")
             print(right @ Vj)
             # line 16: save statistics
@@ -88,9 +80,8 @@ def flash_attention_forward_cpu(Q, K, V):
             state_denominator[block_start_Br:block_end_Br, :] = new_denominator 
 
             O[block_start_Br:block_end_Br, :] = Oi
-            # print("---O---")
-            # print(O[block_start_Br:block_end_Br, :])
-            
+            print("---O---")
+            print(O[block_start_Br:block_end_Br, :])
     return O
 
 
@@ -105,11 +96,11 @@ def flash_attention(Q, K, V, O, S_debug):
     D_HEAD = Q.shape[3]
     BLOCK_SIZE = cuda.blockDim.x
     tid = cuda.threadIdx.x
-
-    sQ = cuda.shared.array(0, dtype=np.float64)[:D_HEAD]
-    sK = cuda.shared.array(0, dtype=np.float64)[D_HEAD:2*D_HEAD]
-    sO = cuda.shared.array(0, dtype=np.float64)[2*D_HEAD:3*D_HEAD]
-    sS = cuda.shared.array(0, dtype=np.float64)[3*D_HEAD:3*D_HEAD + SEQ_LEN**2]
+    
+    sQ = cuda.shared.array(0, dtype=NP_DTYPE)[:D_HEAD]
+    sK = cuda.shared.array(0, dtype=NP_DTYPE)[D_HEAD:2*D_HEAD]
+    sO = cuda.shared.array(0, dtype=NP_DTYPE)[2*D_HEAD:3*D_HEAD]
+    sS = cuda.shared.array(0, dtype=NP_DTYPE)[3*D_HEAD:3*D_HEAD + SEQ_LEN**2]
 
     if tid >= D_HEAD:
         return
@@ -119,8 +110,11 @@ def flash_attention(Q, K, V, O, S_debug):
 
     Q_offset = BLOCK_SIZE * cuda.blockIdx.x
     sQ[tid] = Q[cuda.blockIdx.y, cuda.blockIdx.z, 0, tid + Q_offset]
+    
+    cuda.syncthreads()
 
     for i in range(SEQ_LEN):
+        
         sK[tid] = K[cuda.blockIdx.y, cuda.blockIdx.z, i, tid]
         
         cuda.syncthreads()
@@ -147,6 +141,7 @@ def flash_attention(Q, K, V, O, S_debug):
         sS[cuda.blockIdx.x * SEQ_LEN + i] = tile_numerator
         tile_denominator += sS[cuda.blockIdx.x * SEQ_LEN + i]
 
+    # TODO: can we remove some syncthreads ?
     cuda.syncthreads()
 
     new_rowmax = cuda.libdevice.fmax(prev_rowmax, tile_rowmax)
@@ -188,14 +183,32 @@ def flash_attention(Q, K, V, O, S_debug):
     tile_rowmax = new_rowmax
     tile_denominator = new_denominator
      
+    
+def get_dtype(type):
+    if type == "float32":
+        torch_dtype = torch.float32
+        np_dtype = np.float32
+    elif type == "float64":
+        torch_dtype = torch.float64
+        np_dtype = np.float64
+    elif type == "float16":
+        torch_dtype = torch.float16
+        np_dtype = np.float16
+    else:
+        raise NotImplementedError("dtype not supported")
+    return torch_dtype, np_dtype
 
 if __name__ == "__main__":
-    B, C, SEQ_LEN, D_HEAD = (3, 4, 2, 3) #128
-    Q = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=torch.float64).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
-    K = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=torch.float64).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
-    V = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=torch.float64).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
+
+    TORCH_DTYPE, NP_DTYPE = get_dtype("float32")
+
+    #TODO: https://stackoverflow.com/questions/30209088/how-many-blocks-can-be-allocated-if-i-use-shared-memory
+    B, C, SEQ_LEN, D_HEAD = (1, 1, 50, 1024) #128
+    Q = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=TORCH_DTYPE).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
+    K = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=TORCH_DTYPE).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
+    V = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=TORCH_DTYPE).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
     # TODO: init O with zeros inside the kernel
-    O = torch.zeros((B, C, SEQ_LEN, D_HEAD), dtype=torch.float64)
+    O = torch.zeros((B, C, SEQ_LEN, D_HEAD), dtype=TORCH_DTYPE)
 
     # ref = ref_attention(Q.clone()[0, 0, ...], K.clone()[0, 0, ...], V.clone()[0, 0, ...])
     # pred = flash_attention_forward_cpu(Q.clone()[0, 0, ...], K.clone()[0, 0, ...], V.clone()[0, 0, ...])
@@ -207,15 +220,16 @@ if __name__ == "__main__":
     d_V = cuda.to_device(V)
     d_O = cuda.to_device(O)
 
-    # TODO: Find best number of threads and blocks given compute capability given MAX Shareed Memory size for my gpu 
     stream = cuda.default_stream()
-    threadsperblock = (D_HEAD, 1, 1)
+    # TODO: should support multiple blocks (i.e: D_HEAD // 2) 
+    threadsperblock = (D_HEAD, 1, 1) # Should be max 1024
     blockspergrid = (math.ceil(Q.shape[2] * Q.shape[3] / threadsperblock[0]), B, C)
-    shared_memory_size = (D_HEAD * np.dtype(np.float64).itemsize) * 3 + (SEQ_LEN**2 * np.dtype(np.float64).itemsize)
+    shared_memory_size = (D_HEAD * np.dtype(NP_DTYPE).itemsize) * 3 + (SEQ_LEN**2 * np.dtype(NP_DTYPE).itemsize)
+    # shared memory per block: 49152 bytes
     print(f"blockspergrid: {blockspergrid}, threadsperblock: {threadsperblock}, shared_memory_size: {shared_memory_size}")
 
     # ====== DEBUG ======
-    d_S_debug = cuda.to_device(torch.zeros((B, C, SEQ_LEN, SEQ_LEN), dtype=torch.float64))
+    d_S_debug = cuda.to_device(torch.zeros((B, C, SEQ_LEN, SEQ_LEN), dtype=TORCH_DTYPE))
 
     flash_attention[blockspergrid, threadsperblock, stream, shared_memory_size](
         d_Q,
