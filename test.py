@@ -40,7 +40,7 @@ class TestFlashAttention:
     @pytest.mark.parametrize("seq_len", [32, 64, 128])
     @pytest.mark.parametrize("d_head", [32, 64, 128])
     def test_forward(self, b, c, seq_len, d_head):
-        
+        print(f"b: {b}, c: {c}, seq_len: {seq_len}, d_head: {d_head}")
         Q, K, V = self.initialize_matrices(b, c, seq_len, d_head, torch.float64)
         d_Q, d_K, d_V = self.copy_to_gpu(Q, K, V)
         expected = ref_attention(Q, K, V)

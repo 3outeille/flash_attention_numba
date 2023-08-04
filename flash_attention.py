@@ -2,6 +2,7 @@ import numpy as np
 from numba import cuda, float64
 import math
 import torch
+import time
 
 def get_torch_dtype(str):
     if str == "float32":
@@ -38,10 +39,10 @@ def _flash_attention_forward_kernel(Q, K, V, O):
     BLOCK_SIZE = cuda.blockDim.x
     tid = cuda.threadIdx.x
     
-    sQ = cuda.shared.array(0, dtype=np.float64)[:D_HEAD]
-    sK = cuda.shared.array(0, dtype=np.float64)[D_HEAD:2*D_HEAD]
-    sO = cuda.shared.array(0, dtype=np.float64)[2*D_HEAD:3*D_HEAD]
-    sS = cuda.shared.array(0, dtype=np.float64)[3*D_HEAD:3*D_HEAD + SEQ_LEN**2]
+    sQ = cuda.shared.array(0, dtype=O.dtype)[:D_HEAD]
+    sK = cuda.shared.array(0, dtype=O.dtype)[D_HEAD:2*D_HEAD]
+    sO = cuda.shared.array(0, dtype=O.dtype)[2*D_HEAD:3*D_HEAD]
+    sS = cuda.shared.array(0, dtype=O.dtype)[3*D_HEAD:3*D_HEAD + SEQ_LEN**2]
 
     if tid >= D_HEAD:
         return
@@ -81,20 +82,11 @@ def _flash_attention_forward_kernel(Q, K, V, O):
         sS[cuda.blockIdx.x * SEQ_LEN + i] = tile_numerator
         tile_denominator += sS[cuda.blockIdx.x * SEQ_LEN + i]
 
-    # TODO: can we remove some syncthreads ?
     cuda.syncthreads()
 
     new_rowmax = cuda.libdevice.fmax(prev_rowmax, tile_rowmax)
-
-    cuda.syncthreads()
-
     update_prev_exponent = cuda.libdevice.exp(prev_rowmax - new_rowmax)
-    
-    cuda.syncthreads()
-
     new_denominator = prev_denominator * update_prev_exponent + cuda.libdevice.exp(tile_rowmax - new_rowmax) * tile_denominator
-
-    cuda.syncthreads()
 
     sO[tid] = O[cuda.blockIdx.y, cuda.blockIdx.z, 0, tid + Q_offset]
 
@@ -165,7 +157,9 @@ def flash_attention_forward_gpu(d_Q, d_K, d_V):
 if __name__ == "__main__":
 
     #TODO: https://stackoverflow.com/questions/30209088/how-many-blocks-can-be-allocated-if-i-use-shared-memory
-    B, C, SEQ_LEN, D_HEAD = (32, 128, 32, 32) #128
+    # B, C, SEQ_LEN, D_HEAD = (32, 32, 128, 128) #128
+    B, C, SEQ_LEN, D_HEAD = (32, 32, 50, 1024) #128
+
     Q = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=torch.float64).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
     K = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=torch.float64).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
     V = (torch.arange(B * C * SEQ_LEN * D_HEAD, dtype=torch.float64).reshape(B, C, SEQ_LEN, D_HEAD) + 1.) / 10
@@ -174,7 +168,15 @@ if __name__ == "__main__":
     d_K = cuda.to_device(K)
     d_V = cuda.to_device(V)
 
-    O = flash_attention_forward_gpu(d_Q, d_K, d_V)
+    start_cpu = time.time()
     ref_cpu = ref_attention(Q.clone(), K.clone(), V.clone())
+    end_cpu = time.time()
+
+    start_gpu = time.time()
+    O = flash_attention_forward_gpu(d_Q, d_K, d_V)
+    end_gpu = time.time()
 
     assert torch.allclose(ref_cpu, torch.from_numpy(O))
+    
+    print(f"CPU time: {end_cpu - start_cpu} seconds")
+    print(f"GPU time: {end_gpu - start_gpu} seconds")
